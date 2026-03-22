@@ -1,0 +1,365 @@
+"""
+dns_analyzer.py
+---------------
+DNS Analysis Engine for AI Network Analyst
+-------------------------------------------
+Analyzes structured DNS records from pcap_parser.py and detects:
+  - High NXDOMAIN rates (failed lookups)
+  - Repeated/beaconing queries (same domain queried over and over)
+  - Long or random-looking subdomains (DNS tunneling indicator)
+  - SERVFAIL patterns (resolver issues)
+  - Unusual query types (TXT/NULL used in tunneling)
+
+Output: Summary statistics + list of flagged issues
+
+Usage:
+    from analysis.dns_analyzer import DNSAnalyzer
+    analyzer = DNSAnalyzer(dns_records)
+    result = analyzer.analyze()
+"""
+
+import math
+import re
+import logging
+from collections import Counter, defaultdict
+from typing import List, Dict
+
+logger = logging.getLogger(__name__)
+
+
+class DNSAnalyzer:
+    """
+    Analyzes a list of DNS record dicts (from PCAPParser) to find anomalies.
+
+    Args:
+        dns_records (list): List of DNS record dicts from pcap_parser.
+        nxdomain_threshold (float): Fraction of responses that are NXDOMAIN
+                                    before we flag it (default: 0.3 = 30%)
+        beacon_threshold (int): Number of identical queries before flagging
+                                 as potential beaconing (default: 10)
+        subdomain_length_threshold (int): Subdomain length above which we
+                                           suspect tunneling (default: 40 chars)
+        entropy_threshold (float): Shannon entropy above which a label looks
+                                    random/encoded (default: 3.8)
+    """
+
+    def __init__(
+        self,
+        dns_records: List[Dict],
+        nxdomain_threshold: float = 0.30,
+        beacon_threshold: int = 10,
+        subdomain_length_threshold: int = 40,
+        entropy_threshold: float = 3.8,
+    ):
+        self.records = dns_records
+        self.nxdomain_threshold = nxdomain_threshold
+        self.beacon_threshold = beacon_threshold
+        self.subdomain_length_threshold = subdomain_length_threshold
+        self.entropy_threshold = entropy_threshold
+
+        # Separate queries from responses for analysis
+        self.queries = [r for r in dns_records if not r["is_response"]]
+        self.responses = [r for r in dns_records if r["is_response"]]
+
+    # ─────────────────────────────────────────────
+    # Shannon Entropy (measures randomness of a string)
+    # Higher = more random = more suspicious for domain names
+    # ─────────────────────────────────────────────
+    def _shannon_entropy(self, text: str) -> float:
+        """
+        Calculate Shannon entropy for a string.
+        Used to detect random/encoded subdomains (e.g., Base64 DNS tunneling).
+
+        Score guide:
+            < 2.5  → Normal dictionary word
+            2.5–3.5 → Mixed content
+            > 3.5  → High randomness (suspicious)
+        """
+        if not text:
+            return 0.0
+        text = text.lower()
+        freq = Counter(text)
+        total = len(text)
+        entropy = -sum(
+            (count / total) * math.log2(count / total)
+            for count in freq.values()
+        )
+        return round(entropy, 3)
+
+    def _extract_subdomain(self, domain: str) -> str:
+        """
+        Extract the leftmost subdomain label from a domain name.
+        e.g., 'abc123.evil.com' → 'abc123'
+        """
+        parts = domain.split(".")
+        if len(parts) > 2:
+            return parts[0]
+        return domain
+
+    # ─────────────────────────────────────────────
+    # Detection Methods
+    # ─────────────────────────────────────────────
+
+    def _check_nxdomain_rate(self) -> List[Dict]:
+        """
+        Flag if NXDOMAIN responses exceed the configured threshold.
+        A high rate means many domains are failing to resolve —
+        could indicate misconfiguration, malware C2, or DGA activity.
+        """
+        flags = []
+        if not self.responses:
+            return flags
+
+        nxdomain_count = sum(1 for r in self.responses if r["rcode"] == "NXDOMAIN")
+        rate = nxdomain_count / len(self.responses)
+
+        logger.debug(f"NXDOMAIN rate: {rate:.2%} ({nxdomain_count}/{len(self.responses)})")
+
+        if rate >= self.nxdomain_threshold:
+            flags.append({
+                "type": "HIGH_NXDOMAIN_RATE",
+                "severity": "HIGH" if rate > 0.5 else "MEDIUM",
+                "description": (
+                    f"High NXDOMAIN rate detected: {rate:.1%} of responses "
+                    f"({nxdomain_count} of {len(self.responses)}) failed."
+                ),
+                "detail": {
+                    "nxdomain_count": nxdomain_count,
+                    "total_responses": len(self.responses),
+                    "rate": round(rate, 4),
+                }
+            })
+        return flags
+
+    def _check_repeated_queries(self) -> List[Dict]:
+        """
+        Detect domains queried excessively — possible beaconing behavior.
+        Malware often calls home at regular intervals using the same domain.
+        """
+        flags = []
+
+        # Count how many times each domain was queried
+        domain_counts = Counter()
+        for record in self.queries:
+            for q in record.get("queries", []):
+                domain = q.get("name", "").lower().strip(".")
+                if domain:
+                    domain_counts[domain] += 1
+
+        # Flag domains exceeding the threshold
+        beaconing_candidates = [
+            (domain, count)
+            for domain, count in domain_counts.items()
+            if count >= self.beacon_threshold
+        ]
+
+        if beaconing_candidates:
+            # Sort by frequency descending
+            beaconing_candidates.sort(key=lambda x: x[1], reverse=True)
+            flags.append({
+                "type": "REPEATED_QUERIES",
+                "severity": "MEDIUM",
+                "description": (
+                    f"Detected {len(beaconing_candidates)} domain(s) queried "
+                    f"{self.beacon_threshold}+ times — possible beaconing or misconfiguration."
+                ),
+                "detail": {
+                    "domains": [
+                        {"domain": d, "count": c}
+                        for d, c in beaconing_candidates[:10]  # Top 10
+                    ]
+                }
+            })
+
+        return flags
+
+    def _check_dns_tunneling(self) -> List[Dict]:
+        """
+        Detect possible DNS tunneling by looking for:
+          1. Abnormally long domain labels (Base64/hex-encoded data)
+          2. High Shannon entropy in subdomain labels
+          3. Unusual query types (TXT, NULL) used for data exfiltration
+
+        DNS tunneling tools (like iodine, dnscat2) encode data in subdomains.
+        """
+        flags = []
+        suspicious = []
+
+        # Query types commonly abused for tunneling
+        tunneling_qtypes = {"TXT", "NULL", "PRIVATE", "ANY"}
+
+        for record in self.queries:
+            for q in record.get("queries", []):
+                domain = q.get("name", "").strip(".")
+                qtype = q.get("type", "A")
+
+                if not domain:
+                    continue
+
+                subdomain = self._extract_subdomain(domain)
+                sub_len = len(subdomain)
+                entropy = self._shannon_entropy(subdomain)
+
+                reasons = []
+
+                # Check 1: Abnormally long subdomain
+                if sub_len >= self.subdomain_length_threshold:
+                    reasons.append(f"Long subdomain ({sub_len} chars)")
+
+                # Check 2: High entropy (looks random/encoded)
+                if entropy >= self.entropy_threshold:
+                    reasons.append(f"High entropy ({entropy})")
+
+                # Check 3: Suspicious query type
+                if qtype in tunneling_qtypes:
+                    reasons.append(f"Suspicious query type ({qtype})")
+
+                if reasons:
+                    suspicious.append({
+                        "domain": domain,
+                        "subdomain": subdomain,
+                        "qtype": qtype,
+                        "subdomain_length": sub_len,
+                        "entropy": entropy,
+                        "src_ip": record.get("src_ip", "unknown"),
+                        "reasons": reasons,
+                    })
+
+        if suspicious:
+            flags.append({
+                "type": "POSSIBLE_DNS_TUNNELING",
+                "severity": "HIGH",
+                "description": (
+                    f"Detected {len(suspicious)} DNS queries with tunneling indicators "
+                    f"(long subdomains, high entropy, or unusual query types)."
+                ),
+                "detail": {
+                    "suspicious_queries": suspicious[:20]  # Cap at 20 for readability
+                }
+            })
+
+        return flags
+
+    def _check_servfail(self) -> List[Dict]:
+        """
+        Flag SERVFAIL responses — these indicate DNS resolver/upstream issues.
+        Could mean: broken nameserver, firewall blocking DNS, or DDoS.
+        """
+        flags = []
+        servfail_records = [r for r in self.responses if r["rcode"] == "SERVFAIL"]
+
+        if len(servfail_records) >= 3:
+            # Find which domains are failing
+            failing_domains = []
+            for r in servfail_records:
+                for q in r.get("queries", []):
+                    failing_domains.append(q.get("name", "unknown"))
+
+            domain_counts = Counter(failing_domains).most_common(10)
+
+            flags.append({
+                "type": "SERVFAIL_DETECTED",
+                "severity": "MEDIUM",
+                "description": (
+                    f"{len(servfail_records)} SERVFAIL responses detected — "
+                    f"DNS resolver or upstream nameserver may be failing."
+                ),
+                "detail": {
+                    "servfail_count": len(servfail_records),
+                    "top_failing_domains": [
+                        {"domain": d, "count": c} for d, c in domain_counts
+                    ]
+                }
+            })
+
+        return flags
+
+    def _check_unusual_query_types(self) -> List[Dict]:
+        """
+        Flag unusual DNS query types that are rarely used legitimately.
+        """
+        flags = []
+        unusual_types = {"TXT", "ANY", "NULL", "HINFO", "AXFR", "IXFR"}
+
+        type_counts = Counter()
+        for record in self.queries:
+            for q in record.get("queries", []):
+                qtype = q.get("type", "A")
+                if qtype in unusual_types:
+                    type_counts[qtype] += 1
+
+        if type_counts:
+            flags.append({
+                "type": "UNUSUAL_QUERY_TYPES",
+                "severity": "LOW",
+                "description": (
+                    f"Unusual DNS query types detected: "
+                    f"{dict(type_counts)}. These can indicate tunneling or recon."
+                ),
+                "detail": {"type_counts": dict(type_counts)}
+            })
+
+        return flags
+
+    def _build_query_statistics(self) -> Dict:
+        """Build aggregate statistics about DNS queries."""
+        domain_counts = Counter()
+        qtype_counts = Counter()
+        src_ip_counts = Counter()
+
+        for record in self.queries:
+            src_ip_counts[record.get("src_ip", "unknown")] += 1
+            for q in record.get("queries", []):
+                domain = q.get("name", "").lower().strip(".")
+                if domain:
+                    domain_counts[domain] += 1
+                qtype_counts[q.get("type", "unknown")] += 1
+
+        return {
+            "top_queried_domains": [
+                {"domain": d, "count": c}
+                for d, c in domain_counts.most_common(10)
+            ],
+            "query_type_distribution": dict(qtype_counts),
+            "top_querying_ips": [
+                {"ip": ip, "count": c}
+                for ip, c in src_ip_counts.most_common(10)
+            ],
+            "unique_domains": len(domain_counts),
+            "unique_clients": len(src_ip_counts),
+        }
+
+    # ─────────────────────────────────────────────
+    # Main Analyze Method
+    # ─────────────────────────────────────────────
+
+    def analyze(self) -> Dict:
+        """
+        Run all detection checks and return a comprehensive DNS analysis report.
+
+        Returns:
+            dict with:
+                - 'flags': list of detected anomalies
+                - 'statistics': aggregate DNS stats
+                - 'total_queries': count of queries
+                - 'total_responses': count of responses
+        """
+        logger.info(f"Analyzing {len(self.records)} DNS records...")
+
+        all_flags = []
+        all_flags.extend(self._check_nxdomain_rate())
+        all_flags.extend(self._check_repeated_queries())
+        all_flags.extend(self._check_dns_tunneling())
+        all_flags.extend(self._check_servfail())
+        all_flags.extend(self._check_unusual_query_types())
+
+        stats = self._build_query_statistics()
+
+        logger.info(f"DNS analysis complete. Flags raised: {len(all_flags)}")
+
+        return {
+            "total_queries": len(self.queries),
+            "total_responses": len(self.responses),
+            "flags": all_flags,
+            "statistics": stats,
+        }
